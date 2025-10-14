@@ -1,6 +1,11 @@
 # .github/workflows/ai-review.yml
 name: AI Review
 
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
 on:
   workflow_dispatch:
     inputs:
