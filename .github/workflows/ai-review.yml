@@ -1,0 +1,47 @@
+# .github/workflows/ai-review.yml
+name: AI Review
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  # Модель можно поменять через GitHub → Settings → Variables → Actions (LLM_MODEL)
+  LLM_MODEL: gpt-4o-mini
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install AI Review
+        run: pip install --upgrade pip xai-review
+
+      - name: Run AI Review
+        env:
+          # --- LLM: OpenAI (без Ollama) ---
+          LLM__PROVIDER: OPENAI
+          LLM__HTTP_CLIENT__API_URL: https://api.openai.com/v1
+          LLM__META__MODEL: gpt-4
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+          # --- VCS: GitHub ---
+          VCS__PROVIDER: GITHUB
+          VCS__HTTP_CLIENT__API_URL: https://api.github.com
+          VCS__TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Полный обзор + комменты в PR
+          ai-review run
+          # альтернативы:
+          # ai-review run-summary
+          # ai-review run-inline
