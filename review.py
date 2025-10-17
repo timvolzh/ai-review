@@ -15,92 +15,51 @@ import requests
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from dotenv import load_dotenv
 
+from vcs_client import GitLabClient, GitLabError
+
 # -----------------------------
 # Environment & Configuration
 # -----------------------------
 
 load_dotenv()
 
-GITLAB_URL = os.getenv("GITLAB_URL", "").rstrip("/")
-GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
-PROJECT_ID = os.getenv("GITLAB_PROJECT_ID")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 
-if not (GITLAB_URL and GITLAB_TOKEN and PROJECT_ID):
-    missing = [k for k, v in {
-        'GITLAB_URL': GITLAB_URL,
-        'GITLAB_TOKEN': GITLAB_TOKEN,
-        'GITLAB_PROJECT_ID': PROJECT_ID,
-    }.items() if not v]
-    if missing:
-        print(f"Missing required environment variables: {', '.join(missing)}", file=sys.stderr)
-        print("Please set them or create a .env file.")
-
-HEADERS = {
-    "PRIVATE-TOKEN": GITLAB_TOKEN or "",
-    "Content-Type": "application/json",
+GITLAB_URL = os.getenv("GITLAB_URL", "").rstrip("/")
+GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
+PROJECT_ID = os.getenv("GITLAB_PROJECT_ID")
+VERIFY_GITLAB_SSL = os.getenv("GITLAB_VERIFY_SSL", "false").lower() in {
+    "1",
+    "true",
+    "yes",
 }
 
-SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
-SESSION.verify = False
-requests.packages.urllib3.disable_warnings(category=requests.packages.urllib3.exceptions.InsecureRequestWarning)
-print("⚠️  SSL verification is DISABLED — use only in trusted environments.", file=sys.stderr)
+_gitlab_client: Optional[GitLabClient] = None
 
-# -----------------------------
-# Helpers
-# -----------------------------
 
-class GitLabError(RuntimeError):
-    pass
-
-@retry(reraise=True, stop=stop_after_attempt(4), wait=wait_exponential(multiplier=0.5, min=0.5, max=6), retry=retry_if_exception_type(requests.RequestException))
-def _gl_get(path: str, params: Optional[dict] = None) -> requests.Response:
-    if not GITLAB_URL:
-        raise GitLabError("GITLAB_URL is not configured")
-    url = f"{GITLAB_URL}/api/v4{path}"
-    resp = SESSION.get(url, params=params, timeout=30)
-    if resp.status_code >= 400:
-        raise GitLabError(f"GET {url} failed: {resp.status_code} {resp.text[:200]}")
-    return resp
-
-@retry(reraise=True, stop=stop_after_attempt(4), wait=wait_exponential(multiplier=0.5, min=0.5, max=6), retry=retry_if_exception_type(requests.RequestException))
-def _gl_post(path: str, json: dict) -> requests.Response:
-    if not GITLAB_URL:
-        raise GitLabError("GITLAB_URL is not configured")
-    url = f"{GITLAB_URL}/api/v4{path}"
-    resp = SESSION.post(url, json=json, timeout=30)
-    if resp.status_code >= 400:
-        raise GitLabError(f"POST {url} failed: {resp.status_code} {resp.text[:200]}")
-    return resp
-
-# -----------------------------
-# GitLab API wrappers
-# -----------------------------
-
-def list_open_merge_requests(project_id: str, per_page: int = 50) -> List[dict]:
-    mrs: List[dict] = []
-    page = 1
-    while True:
-        resp = _gl_get(f"/projects/{project_id}/merge_requests", params={"state": "opened", "per_page": per_page, "page": page, "order_by": "updated_at", "sort": "desc"})
-        batch = resp.json()
-        if not batch:
-            break
-        mrs.extend(batch)
-        if len(batch) < per_page:
-            break
-        page += 1
-    return mrs
-
-def get_merge_request(project_id: str, iid: int) -> dict:
-    return _gl_get(f"/projects/{project_id}/merge_requests/{iid}").json()
-
-def get_merge_request_changes(project_id: str, iid: int) -> dict:
-    return _gl_get(f"/projects/{project_id}/merge_requests/{iid}/changes").json()
-
-def post_merge_request_note(project_id: str, iid: int, body_markdown: str) -> dict:
-    return _gl_post(f"/projects/{project_id}/merge_requests/{iid}/notes", json={"body": body_markdown}).json()
+def get_gitlab_client() -> GitLabClient:
+    global _gitlab_client
+    if _gitlab_client is None:
+        if not GITLAB_URL:
+            raise GitLabError("Set GITLAB_URL to interact with GitLab.")
+        if not GITLAB_TOKEN:
+            raise GitLabError("Set GITLAB_TOKEN to interact with GitLab.")
+        client = GitLabClient(
+            GITLAB_URL,
+            GITLAB_TOKEN,
+            verify_ssl=VERIFY_GITLAB_SSL,
+        )
+        if not VERIFY_GITLAB_SSL:
+            requests.packages.urllib3.disable_warnings(  # type: ignore[attr-defined]
+                category=requests.packages.urllib3.exceptions.InsecureRequestWarning  # type: ignore[attr-defined]
+            )
+            print(
+                "⚠️  SSL verification is DISABLED — use only in trusted environments.",
+                file=sys.stderr,
+            )
+        _gitlab_client = client
+    return _gitlab_client
 
 # -----------------------------
 # Ollama client
@@ -231,9 +190,15 @@ def split_for_notes(text: str, max_len: int = MAX_NOTE_SIZE) -> List[str]:
         start = split_at
     return [p for p in parts if p]
 
-def review_and_comment(project_id: str, iid: int, model: Optional[str] = None, dry_run: bool = False) -> None:
-    mr = get_merge_request(project_id, iid)
-    changes_doc = get_merge_request_changes(project_id, iid)
+def review_and_comment(
+    client: GitLabClient,
+    project_id: str,
+    iid: int,
+    model: Optional[str] = None,
+    dry_run: bool = False,
+) -> None:
+    mr = client.get_merge_request(project_id, iid)
+    changes_doc = client.get_merge_request_changes(project_id, iid)
     changes = changes_doc.get("changes", [])
     if not changes:
         print(f"MR !{iid} has no changes to review.")
@@ -246,7 +211,7 @@ def review_and_comment(project_id: str, iid: int, model: Optional[str] = None, d
         return
     for i, note in enumerate(chunks, start=1):
         prefix = f"(Part {i}/{len(chunks)})\n\n" if len(chunks) > 1 else ""
-        resp = post_merge_request_note(project_id, iid, prefix + note)
+        resp = client.post_merge_request_note(project_id, iid, prefix + note)
         url = resp.get("web_url") or resp.get("url") or ""
         print(f"Posted note {i}/{len(chunks)} to MR !{iid}. {url}")
 
@@ -270,7 +235,12 @@ def main() -> None:
         if not PROJECT_ID:
             print("Set GITLAB_PROJECT_ID to list MRs.")
             sys.exit(2)
-        mrs = list_open_merge_requests(PROJECT_ID)
+        try:
+            client = get_gitlab_client()
+        except GitLabError as exc:
+            print(str(exc))
+            sys.exit(2)
+        mrs = client.list_open_merge_requests(PROJECT_ID)
         if not mrs:
             print("No open merge requests.")
             return
@@ -281,16 +251,26 @@ def main() -> None:
         if not (PROJECT_ID and GITLAB_URL and GITLAB_TOKEN):
             print("Set GITLAB_URL, GITLAB_TOKEN, and GITLAB_PROJECT_ID to review an MR.")
             sys.exit(2)
-        review_and_comment(PROJECT_ID, args.iid, model=args.model, dry_run=args.dry_run)
+        try:
+            client = get_gitlab_client()
+        except GitLabError as exc:
+            print(str(exc))
+            sys.exit(2)
+        review_and_comment(client, PROJECT_ID, args.iid, model=args.model, dry_run=args.dry_run)
         return
     if args.all:
         if not (PROJECT_ID and GITLAB_URL and GITLAB_TOKEN):
             print("Set GITLAB_URL, GITLAB_TOKEN, and GITLAB_PROJECT_ID to review MRs.")
             sys.exit(2)
-        mrs = list_open_merge_requests(PROJECT_ID)
+        try:
+            client = get_gitlab_client()
+        except GitLabError as exc:
+            print(str(exc))
+            sys.exit(2)
+        mrs = client.list_open_merge_requests(PROJECT_ID)
         for mr in mrs:
             print(f"\n=== Reviewing MR !{mr['iid']}: {mr['title']} ===")
-            review_and_comment(PROJECT_ID, mr['iid'], model=args.model, dry_run=args.dry_run)
+            review_and_comment(client, PROJECT_ID, mr['iid'], model=args.model, dry_run=args.dry_run)
         return
 
 if __name__ == "__main__":
