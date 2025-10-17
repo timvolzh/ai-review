@@ -12,9 +12,14 @@ import time
 from typing import List, Optional, Tuple
 
 import requests
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from dotenv import load_dotenv
 
+from ai_prompt import (
+    REVIEW_SYSTEM_PROMPT,
+    REVIEW_USER_PROMPT_TEMPLATE,
+    SUMMARY_PROMPT_TEMPLATE,
+)
+from llm_client import OllamaError, ollama_generate
 from vcs_client import GitLabClient, GitLabError
 
 # -----------------------------
@@ -62,58 +67,11 @@ def get_gitlab_client() -> GitLabClient:
     return _gitlab_client
 
 # -----------------------------
-# Ollama client
-# -----------------------------
-
-class OllamaError(RuntimeError):
-    pass
-
-@retry(reraise=True, stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.5, min=0.5, max=4), retry=retry_if_exception_type(requests.RequestException))
-def ollama_generate(prompt: str, model: Optional[str] = None, temperature: float = 0.2, system: Optional[str] = None) -> str:
-    model = model or OLLAMA_MODEL
-    url = f"{OLLAMA_URL}/api/generate"
-    payload = {"model": model, "prompt": prompt, "stream": False, "options": {"temperature": temperature}}
-    if system:
-        payload["system"] = system
-    resp = requests.post(url, json=payload, timeout=120, verify=False)
-    if resp.status_code >= 400:
-        raise OllamaError(f"Ollama error {resp.status_code}: {resp.text[:200]}")
-    data = resp.json()
-    return data.get("response", "").strip()
-
-# -----------------------------
 # Review pipeline
 # -----------------------------
 
 MAX_CHARS_PER_CHUNK = 8000
 MAX_NOTE_SIZE = 10000
-
-REVIEW_SYSTEM_PROMPT = (
-    "You are a senior software engineer performing a thorough code review on a Git diff. "
-    "Be pragmatic: focus on correctness, security, readability, performance, and maintainability. "
-    "Point out broken tests, edge cases, anti-patterns, concurrency issues, error handling, logging, and docs. "
-    "If you propose code changes, format them using GitLab suggestion blocks where possible."
-)
-
-REVIEW_USER_PROMPT_TEMPLATE = textwrap.dedent(
-    """
-    Merge Request: {title}
-    Author: {author}
-    Description:\n{description}
-
-    Review the following Git diff chunk. For each file, list findings as bullets under a `### <file>` heading.
-    Be concise but specific. Use examples. Use GitLab suggestion blocks for small fixes:
-
-    ```suggestion
-    // new code here
-    ```
-
-    Diff chunk:
-    ```diff
-    {diff_text}
-    ```
-    """
-).strip()
 
 def chunk_diffs(changes: List[dict]) -> List[Tuple[str, List[str]]]:
     chunks, buf, paths, size = [], [], [], 0
@@ -139,28 +97,35 @@ def build_review_for_mr(mr: dict, changes: List[dict], model: Optional[str] = No
     chunks = chunk_diffs(changes)
     all_sections = []
     for idx, (chunk_text, paths) in enumerate(chunks, start=1):
-        user_prompt = REVIEW_USER_PROMPT_TEMPLATE.format(title=title, author=author, description=description, diff_text=chunk_text)
+        user_prompt = REVIEW_USER_PROMPT_TEMPLATE.format(
+            title=title,
+            author=author,
+            description=description,
+            diff_text=chunk_text,
+        )
         try:
-            section = ollama_generate(user_prompt, model=model, system=REVIEW_SYSTEM_PROMPT)
-        except Exception as e:
+            section = ollama_generate(
+                user_prompt,
+                base_url=OLLAMA_URL,
+                model=model or OLLAMA_MODEL,
+                system=REVIEW_SYSTEM_PROMPT,
+            )
+        except (OllamaError, requests.RequestException) as e:
             section = f"(Error generating review for chunk {idx}: {e})"
         header = f"## Review chunk {idx}/{len(chunks)} ({', '.join(paths)})"
         all_sections.append(f"{header}\n\n{section}\n")
         time.sleep(0.2)
-    summary_prompt = textwrap.dedent(f"""
-        Based on the following per-chunk reviews, write a concise overall summary with priority labels:
-        - MUST FIX (blocking)
-        - SHOULD FIX (important)
-        - NICE TO HAVE (non-blocking)
-
-        Keep it under 200 words.
-
-        Reviews:
-        {"\n\n".join(all_sections)[:6000]}
-    """)
+    summary_prompt = SUMMARY_PROMPT_TEMPLATE.format(
+        reviews="\n\n".join(all_sections)[:6000]
+    )
     try:
-        summary = ollama_generate(summary_prompt, model=model, system=REVIEW_SYSTEM_PROMPT)
-    except Exception as e:
+        summary = ollama_generate(
+            summary_prompt,
+            base_url=OLLAMA_URL,
+            model=model or OLLAMA_MODEL,
+            system=REVIEW_SYSTEM_PROMPT,
+        )
+    except (OllamaError, requests.RequestException) as e:
         summary = f"(Error generating summary: {e})"
     header_block = textwrap.dedent(f"""
         # 🤖 AI Code Review (model: {model or OLLAMA_MODEL})
