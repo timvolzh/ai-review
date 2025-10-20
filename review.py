@@ -9,7 +9,7 @@ import os
 import sys
 import textwrap
 import time
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
@@ -20,7 +20,12 @@ from ai_prompt import (
     SUMMARY_PROMPT_TEMPLATE,
 )
 from llm_client import OllamaError, ollama_generate
-from vcs_client import GitLabClient, GitLabError
+from vcs_client import (
+    BitbucketClient,
+    BitbucketError,
+    GitLabClient,
+    GitLabError,
+)
 
 # -----------------------------
 # Environment & Configuration
@@ -28,19 +33,43 @@ from vcs_client import GitLabClient, GitLabError
 
 load_dotenv()
 
+VCS_PROVIDER = os.getenv("VCS_PROVIDER", "gitlab").strip().lower()
+
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 
 GITLAB_URL = os.getenv("GITLAB_URL", "").rstrip("/")
 GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
-PROJECT_ID = os.getenv("GITLAB_PROJECT_ID")
+GITLAB_PROJECT_ID = os.getenv("GITLAB_PROJECT_ID")
 VERIFY_GITLAB_SSL = os.getenv("GITLAB_VERIFY_SSL", "false").lower() in {
     "1",
     "true",
     "yes",
 }
 
+BITBUCKET_URL = os.getenv("BITBUCKET_URL", "https://api.bitbucket.org").rstrip("/")
+BITBUCKET_USERNAME = os.getenv("BITBUCKET_USERNAME")
+BITBUCKET_APP_PASSWORD = os.getenv("BITBUCKET_APP_PASSWORD")
+BITBUCKET_WORKSPACE = os.getenv("BITBUCKET_WORKSPACE")
+BITBUCKET_REPO_SLUG = os.getenv("BITBUCKET_REPO_SLUG")
+VERIFY_BITBUCKET_SSL = os.getenv("BITBUCKET_VERIFY_SSL", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+
 _gitlab_client: Optional[GitLabClient] = None
+_bitbucket_client: Optional[BitbucketClient] = None
+
+
+def _warn_ssl_disabled(provider_name: str) -> None:
+    requests.packages.urllib3.disable_warnings(  # type: ignore[attr-defined]
+        category=requests.packages.urllib3.exceptions.InsecureRequestWarning  # type: ignore[attr-defined]
+    )
+    print(
+        f"⚠️  SSL verification is DISABLED for {provider_name} — use only in trusted environments.",
+        file=sys.stderr,
+    )
 
 
 def get_gitlab_client() -> GitLabClient:
@@ -56,15 +85,63 @@ def get_gitlab_client() -> GitLabClient:
             verify_ssl=VERIFY_GITLAB_SSL,
         )
         if not VERIFY_GITLAB_SSL:
-            requests.packages.urllib3.disable_warnings(  # type: ignore[attr-defined]
-                category=requests.packages.urllib3.exceptions.InsecureRequestWarning  # type: ignore[attr-defined]
-            )
-            print(
-                "⚠️  SSL verification is DISABLED — use only in trusted environments.",
-                file=sys.stderr,
-            )
+            _warn_ssl_disabled("GitLab")
         _gitlab_client = client
     return _gitlab_client
+
+
+def get_bitbucket_client() -> BitbucketClient:
+    global _bitbucket_client
+    if _bitbucket_client is None:
+        if not BITBUCKET_USERNAME:
+            raise BitbucketError("Set BITBUCKET_USERNAME to interact with Bitbucket.")
+        if not BITBUCKET_APP_PASSWORD:
+            raise BitbucketError(
+                "Set BITBUCKET_APP_PASSWORD to interact with Bitbucket."
+            )
+        client = BitbucketClient(
+            BITBUCKET_URL,
+            BITBUCKET_USERNAME,
+            BITBUCKET_APP_PASSWORD,
+            verify_ssl=VERIFY_BITBUCKET_SSL,
+        )
+        if not VERIFY_BITBUCKET_SSL:
+            _warn_ssl_disabled("Bitbucket")
+        _bitbucket_client = client
+    return _bitbucket_client
+
+
+def get_vcs_client(provider: str):
+    if provider == "gitlab":
+        return get_gitlab_client()
+    if provider == "bitbucket":
+        return get_bitbucket_client()
+    raise RuntimeError(f"Unsupported VCS provider: {provider}")
+
+
+def resolve_project_identifier(provider: str) -> str:
+    if provider == "gitlab":
+        return GITLAB_PROJECT_ID or ""
+    if provider == "bitbucket":
+        if BITBUCKET_WORKSPACE and BITBUCKET_REPO_SLUG:
+            return f"{BITBUCKET_WORKSPACE}/{BITBUCKET_REPO_SLUG}"
+        return ""
+    return ""
+
+
+def missing_target_message(provider: str) -> str:
+    if provider == "gitlab":
+        return "Set GITLAB_PROJECT_ID to select a project."
+    if provider == "bitbucket":
+        return "Set BITBUCKET_WORKSPACE and BITBUCKET_REPO_SLUG to select a repository."
+    return "Unknown VCS provider; set VCS_PROVIDER or --vcs."
+
+
+def format_request_id(provider: str, iid: Any) -> str:
+    prefix = "!" if provider == "gitlab" else "#"
+    if iid is None:
+        return f"{prefix}?"
+    return f"{prefix}{iid}"
 
 # -----------------------------
 # Review pipeline
@@ -90,7 +167,13 @@ def chunk_diffs(changes: List[dict]) -> List[Tuple[str, List[str]]]:
         chunks.append(("".join(buf), paths.copy()))
     return chunks
 
-def build_review_for_mr(mr: dict, changes: List[dict], model: Optional[str] = None) -> str:
+def build_review_for_mr(
+    mr: dict,
+    changes: List[dict],
+    *,
+    model: Optional[str] = None,
+    provider: str = "gitlab",
+) -> str:
     title = mr.get("title", "")
     author = (mr.get("author") or {}).get("name", "unknown")
     description = (mr.get("description") or "(no description)").strip()
@@ -127,11 +210,12 @@ def build_review_for_mr(mr: dict, changes: List[dict], model: Optional[str] = No
         )
     except (OllamaError, requests.RequestException) as e:
         summary = f"(Error generating summary: {e})"
+    request_label = format_request_id(provider, mr.get("iid"))
     header_block = textwrap.dedent(f"""
         # 🤖 AI Code Review (model: {model or OLLAMA_MODEL})
         _This is an automated review. Please verify suggestions before applying._
 
-        **MR:** !{mr.get('iid')} — **{title}**  
+        **Request:** {request_label} — **{title}**
         **Author:** {author}
 
         ---
@@ -156,86 +240,125 @@ def split_for_notes(text: str, max_len: int = MAX_NOTE_SIZE) -> List[str]:
     return [p for p in parts if p]
 
 def review_and_comment(
-    client: GitLabClient,
-    project_id: str,
+    client: Any,
+    target_identifier: str,
     iid: int,
     model: Optional[str] = None,
     dry_run: bool = False,
+    provider: str = "gitlab",
 ) -> None:
-    mr = client.get_merge_request(project_id, iid)
-    changes_doc = client.get_merge_request_changes(project_id, iid)
+    mr = client.get_merge_request(target_identifier, iid)
+    changes_doc = client.get_merge_request_changes(target_identifier, iid)
     changes = changes_doc.get("changes", [])
     if not changes:
-        print(f"MR !{iid} has no changes to review.")
+        print(f"Request {format_request_id(provider, iid)} has no changes to review.")
         return
-    review_md = build_review_for_mr(mr, changes, model=model)
+    review_md = build_review_for_mr(
+        mr,
+        changes,
+        model=model,
+        provider=provider,
+    )
     chunks = split_for_notes(review_md)
     if dry_run:
-        print(f"--- DRY RUN: Would post {len(chunks)} note(s) to MR !{iid} ---")
+        request_label = format_request_id(provider, iid)
+        print(
+            f"--- DRY RUN: Would post {len(chunks)} note(s) to request {request_label} ---"
+        )
         print(review_md[:2000] + ("..." if len(review_md) > 2000 else ""))
         return
     for i, note in enumerate(chunks, start=1):
         prefix = f"(Part {i}/{len(chunks)})\n\n" if len(chunks) > 1 else ""
-        resp = client.post_merge_request_note(project_id, iid, prefix + note)
+        resp = client.post_merge_request_note(target_identifier, iid, prefix + note)
         url = resp.get("web_url") or resp.get("url") or ""
-        print(f"Posted note {i}/{len(chunks)} to MR !{iid}. {url}")
+        request_label = format_request_id(provider, iid)
+        print(f"Posted note {i}/{len(chunks)} to request {request_label}. {url}")
 
 # -----------------------------
 # CLI
 # -----------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="AI MR Reviewer for GitLab using Ollama (SSL disabled)")
+    p = argparse.ArgumentParser(
+        description="AI reviewer for GitLab or Bitbucket powered by Ollama",
+    )
     g_target = p.add_mutually_exclusive_group(required=True)
-    g_target.add_argument("--iid", type=int, help="Review a specific MR by IID")
-    g_target.add_argument("--list", action="store_true", help="List open MRs and exit")
-    g_target.add_argument("--all", action="store_true", help="Review all open MRs")
+    g_target.add_argument("--iid", type=int, help="Review a specific request by IID")
+    g_target.add_argument("--list", action="store_true", help="List open requests and exit")
+    g_target.add_argument("--all", action="store_true", help="Review all open requests")
+    p.add_argument(
+        "--vcs",
+        choices=["gitlab", "bitbucket"],
+        default=VCS_PROVIDER,
+        help="VCS provider to use (default: %(default)s or VCS_PROVIDER env)",
+    )
     p.add_argument("--model", default=OLLAMA_MODEL, help=f"Ollama model to use (default: {OLLAMA_MODEL})")
-    p.add_argument("--dry-run", action="store_true", help="Don't post to GitLab; print a preview")
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Don't post to the VCS; print a preview",
+    )
     return p.parse_args()
 
 def main() -> None:
     args = parse_args()
-    if args.list:
-        if not PROJECT_ID:
-            print("Set GITLAB_PROJECT_ID to list MRs.")
-            sys.exit(2)
+    provider = args.vcs.lower()
+    target_identifier = resolve_project_identifier(provider)
+    error_types = (GitLabError, BitbucketError, RuntimeError)
+
+    def get_client_or_exit() -> Any:
         try:
-            client = get_gitlab_client()
-        except GitLabError as exc:
+            return get_vcs_client(provider)
+        except error_types as exc:
             print(str(exc))
             sys.exit(2)
-        mrs = client.list_open_merge_requests(PROJECT_ID)
+
+    if args.list:
+        if not target_identifier:
+            print(missing_target_message(provider))
+            sys.exit(2)
+        client = get_client_or_exit()
+        mrs = client.list_open_merge_requests(target_identifier)
         if not mrs:
-            print("No open merge requests.")
+            print("No open merge or pull requests.")
             return
         for mr in mrs:
-            print(f"!{mr['iid']}: {mr['title']} (by {mr['author']['name']}) — {mr['web_url']}")
+            label = format_request_id(provider, mr.get("iid"))
+            author = (mr.get("author") or {}).get("name", "unknown")
+            url = mr.get("web_url", "")
+            print(f"{label}: {mr['title']} (by {author}) — {url}")
         return
     if args.iid:
-        if not (PROJECT_ID and GITLAB_URL and GITLAB_TOKEN):
-            print("Set GITLAB_URL, GITLAB_TOKEN, and GITLAB_PROJECT_ID to review an MR.")
+        if not target_identifier:
+            print(missing_target_message(provider))
             sys.exit(2)
-        try:
-            client = get_gitlab_client()
-        except GitLabError as exc:
-            print(str(exc))
-            sys.exit(2)
-        review_and_comment(client, PROJECT_ID, args.iid, model=args.model, dry_run=args.dry_run)
+        client = get_client_or_exit()
+        review_and_comment(
+            client,
+            target_identifier,
+            args.iid,
+            model=args.model,
+            dry_run=args.dry_run,
+            provider=provider,
+        )
         return
     if args.all:
-        if not (PROJECT_ID and GITLAB_URL and GITLAB_TOKEN):
-            print("Set GITLAB_URL, GITLAB_TOKEN, and GITLAB_PROJECT_ID to review MRs.")
+        if not target_identifier:
+            print(missing_target_message(provider))
             sys.exit(2)
-        try:
-            client = get_gitlab_client()
-        except GitLabError as exc:
-            print(str(exc))
-            sys.exit(2)
-        mrs = client.list_open_merge_requests(PROJECT_ID)
+        client = get_client_or_exit()
+        mrs = client.list_open_merge_requests(target_identifier)
         for mr in mrs:
-            print(f"\n=== Reviewing MR !{mr['iid']}: {mr['title']} ===")
-            review_and_comment(client, PROJECT_ID, mr['iid'], model=args.model, dry_run=args.dry_run)
+            label = format_request_id(provider, mr.get("iid"))
+            print(f"\n=== Reviewing request {label}: {mr['title']} ===")
+            review_and_comment(
+                client,
+                target_identifier,
+                mr["iid"],
+                model=args.model,
+                dry_run=args.dry_run,
+                provider=provider,
+            )
         return
 
 if __name__ == "__main__":
