@@ -29,8 +29,6 @@ class BitbucketClient:
         if not app_password:
             raise BitbucketError("Bitbucket app password is required")
         self._base_url = base_url.rstrip("/")
-        if not self._base_url.endswith("/2.0"):
-            self._base_url += "/2.0"
         self._timeout = timeout
         self._session = requests.Session()
         self._session.auth = (username, app_password)
@@ -59,7 +57,7 @@ class BitbucketClient:
         if resp.status_code >= 400:
             snippet = resp.text[:200]
             raise BitbucketError(
-                f"{method.upper()} {path} failed: {resp.status_code} {snippet}"
+                f"{method.upper()} {url} failed: {resp.status_code} {snippet}"
             )
         return resp
 
@@ -150,14 +148,14 @@ class BitbucketClient:
 
     def get_merge_request(self, repo_identifier: str, iid: int) -> dict:
         workspace, repo_slug = self._split_repo_identifier(repo_identifier)
-        path = f"/repositories/{workspace}/{repo_slug}/pullrequests/{iid}"
+        path = f"/rest/api/1.0/projects/{workspace}/repos/{repo_slug}/pull-requests/{iid}"
         pr = self._get(path).json()
         return self._normalize_pr(pr)
 
     def get_merge_request_changes(self, repo_identifier: str, iid: int) -> dict:
         workspace, repo_slug = self._split_repo_identifier(repo_identifier)
         path = (
-            f"/repositories/{workspace}/{repo_slug}/pullrequests/{iid}/diff"
+            f"/rest/api/1.0/projects/{workspace}/repos/{repo_slug}/pull-requests/{iid}/diff"
         )
         diff_text = self._get(path).text
         return {"changes": self._parse_diff(diff_text)}
@@ -167,9 +165,11 @@ class BitbucketClient:
     ) -> dict:
         workspace, repo_slug = self._split_repo_identifier(repo_identifier)
         path = (
-            f"/repositories/{workspace}/{repo_slug}/pullrequests/{iid}/comments"
+            f"/rest/api/1.0/projects/{workspace}/repos/{repo_slug}/pull-requests/{iid}/comments"
         )
-        payload = {"content": {"raw": body_markdown}}
+
+        #payload = {"content": {"raw": body_markdown}}
+        payload = {"text": body_markdown}
         resp = self._post(path, json=payload).json()
         links = resp.get("links") or {}
         html_link = links.get("html") or {}
